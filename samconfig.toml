@@ -1,0 +1,25 @@
+version = 0.1
+
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "weekly-news-automation"
+s3_prefix = "weekly-news-automation"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = [
+    "SlackChannelId=REPLACE_WITH_YOUR_CHANNEL_ID",
+    "NewsdataSecretName=NEWS_DATA_API_KEY",
+    "AnthropicSecretName=ANTHROPIC_API_KEY",
+    "SlackSecretName=SLACK_BOT_TOKEN",
+    "UseDynamoDB=true"
+]
+
+[default.build]
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate]
+[default.validate.parameters]
+lint = true

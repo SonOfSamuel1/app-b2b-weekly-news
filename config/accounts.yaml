@@ -1,0 +1,86 @@
+# Account Configuration for Weekly News Automation
+# Each account represents a company you want to track
+
+accounts:
+  # Example Account 1
+  - company: "Salesforce"
+    website: "salesforce.com"
+    newsroom: "https://www.salesforce.com/news/"
+    keywords:
+      - partnership
+      - customer
+      - acquisition
+      - launch
+      - Einstein
+      - integration
+      - compliance
+      - security
+
+  # Example Account 2
+  - company: "Snowflake Inc."
+    website: "snowflake.com"
+    newsroom: "https://www.snowflake.com/news/"
+    keywords:
+      - partnership
+      - customer
+      - data cloud
+      - launch
+      - integration
+      - funding
+      - acquisition
+
+  # Example Account 3
+  - company: "MongoDB"
+    website: "mongodb.com"
+    newsroom: "https://www.mongodb.com/press"
+    keywords:
+      - partnership
+      - customer
+      - Atlas
+      - launch
+      - database
+      - integration
+      - developer
+
+  # Example Account 4 - Without newsroom
+  - company: "Stripe"
+    website: "stripe.com"
+    keywords:
+      - partnership
+      - customer
+      - payments
+      - launch
+      - integration
+      - funding
+      - fintech
+      - acquisition
+
+  # Example Account 5
+  - company: "Datadog"
+    website: "datadoghq.com"
+    newsroom: "https://www.datadoghq.com/about/latest-news/press-releases/"
+    keywords:
+      - partnership
+      - customer
+      - monitoring
+      - launch
+      - integration
+      - observability
+      - security
+
+# Instructions:
+# 1. Replace these examples with your actual target accounts
+# 2. For each account, provide:
+#    - company: The official legal name (used in news searches)
+#    - website: The root domain (without www)
+#    - keywords: 4-10 relevant business terms for press wire searches
+#    - newsroom: Optional URL to company's press release page or RSS feed
+#
+# 3. Keywords should focus on:
+#    - Business events: partnership, customer, acquisition, funding
+#    - Product launches: launch, release, introduces, announces
+#    - Strategic terms: integration, platform, expansion
+#    - Sector-specific terms relevant to that company
+#
+# 4. Keep the list to 10-25 priority accounts for optimal performance
+# 5. This file can be stored locally or uploaded to S3 (configure via SAM parameters)
