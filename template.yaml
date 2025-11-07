@@ -1,0 +1,225 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Weekly Account-News Automation with AWS Lambda
+
+Parameters:
+  SlackChannelId:
+    Type: String
+    Description: Slack channel ID for posting briefs
+
+  NewsdataSecretName:
+    Type: String
+    Default: NEWS_DATA_API_KEY
+    Description: Secrets Manager secret name for Newsdata.io API key
+
+  AnthropicSecretName:
+    Type: String
+    Default: ANTHROPIC_API_KEY
+    Description: Secrets Manager secret name for Anthropic API key
+
+  SlackSecretName:
+    Type: String
+    Default: SLACK_BOT_TOKEN
+    Description: Secrets Manager secret name for Slack bot token
+
+  ConfigS3Bucket:
+    Type: String
+    Default: ""
+    Description: Optional S3 bucket for account configuration
+
+  ConfigS3Key:
+    Type: String
+    Default: ""
+    Description: Optional S3 key for account configuration
+
+  UseDynamoDB:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Enable DynamoDB for deduplication tracking
+
+  ArchiveS3Bucket:
+    Type: String
+    Default: ""
+    Description: Optional S3 bucket for archiving briefs
+
+Conditions:
+  CreateDynamoDBTable: !Equals [!Ref UseDynamoDB, "true"]
+  CreateArchiveBucket: !Not [!Equals [!Ref ArchiveS3Bucket, ""]]
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 1536
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+
+Resources:
+  # Lambda Function
+  WeeklyNewsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src.handler.lambda_handler
+      Description: Weekly account news automation
+      Environment:
+        Variables:
+          SLACK_CHANNEL_ID: !Ref SlackChannelId
+          TIMEZONE: America/New_York
+          DAYS_LOOKBACK: "7"
+          ARTICLES_PER_ACCOUNT: "12"
+          ANTHROPIC_MODEL: claude-sonnet-4-5-20250929
+          NEWS_DATA_SECRET_NAME: !Ref NewsdataSecretName
+          ANTHROPIC_SECRET_NAME: !Ref AnthropicSecretName
+          SLACK_SECRET_NAME: !Ref SlackSecretName
+          CONFIG_S3_BUCKET: !Ref ConfigS3Bucket
+          CONFIG_S3_KEY: !Ref ConfigS3Key
+          USE_DYNAMODB: !Ref UseDynamoDB
+          DYNAMODB_TABLE: !If [CreateDynamoDBTable, !Ref SeenUrlsTable, ""]
+          ARCHIVE_S3_BUCKET: !Ref ArchiveS3Bucket
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            # Secrets Manager access
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${NewsdataSecretName}*"
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AnthropicSecretName}*"
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SlackSecretName}*"
+            # DynamoDB access (conditional)
+            - !If
+              - CreateDynamoDBTable
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt SeenUrlsTable.Arn
+              - !Ref AWS::NoValue
+            # S3 config access (conditional)
+            - !If
+              - !Not [!Equals [!Ref ConfigS3Bucket, ""]]
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${ConfigS3Bucket}/${ConfigS3Key}"
+              - !Ref AWS::NoValue
+            # S3 archive access (conditional)
+            - !If
+              - CreateArchiveBucket
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${ArchiveS3Bucket}/briefs/*"
+              - !Ref AWS::NoValue
+      ReservedConcurrentExecutions: 2
+
+  # DynamoDB Table for tracking seen URLs (optional)
+  SeenUrlsTable:
+    Type: AWS::DynamoDB::Table
+    Condition: CreateDynamoDBTable
+    Properties:
+      TableName: weekly-news-seen-urls
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+      Tags:
+        - Key: Application
+          Value: weekly-news-automation
+
+  # EventBridge Scheduler Role
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt WeeklyNewsFunction.Arn
+
+  # EventBridge Schedule - Every Monday at 08:05 ET
+  WeeklySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: weekly-news-monday-morning
+      Description: Trigger weekly account news automation every Monday at 08:05 ET
+      ScheduleExpression: cron(5 13 ? * MON *)  # 13:05 UTC = 08:05 ET (EST)
+      ScheduleExpressionTimezone: America/New_York
+      FlexibleTimeWindow:
+        Mode: FLEXIBLE
+        MaximumWindowInMinutes: 5
+      Target:
+        Arn: !GetAtt WeeklyNewsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"dry_run": false}'
+
+  # CloudWatch Log Group
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${WeeklyNewsFunction}"
+      RetentionInDays: 30
+
+  # CloudWatch Alarm for errors
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: weekly-news-errors
+      AlarmDescription: Alert when weekly news function has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WeeklyNewsFunction
+
+Outputs:
+  WeeklyNewsFunctionArn:
+    Description: ARN of the weekly news Lambda function
+    Value: !GetAtt WeeklyNewsFunction.Arn
+
+  FunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref WeeklyNewsFunction
+
+  ScheduleName:
+    Description: Name of the EventBridge schedule
+    Value: !Ref WeeklySchedule
+
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table (if created)
+    Value: !If [CreateDynamoDBTable, !Ref SeenUrlsTable, "N/A"]
