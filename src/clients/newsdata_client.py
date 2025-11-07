@@ -3,8 +3,20 @@ import time
 import requests
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlparse
 import pytz
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from src.constants import (
+    DEFAULT_NEWS_API_TIMEOUT,
+    DEFAULT_NEWS_API_MAX_RETRIES,
+    DEFAULT_NEWS_MAX_PAGES,
+    PRESS_WIRE_DOMAINS,
+    BLOCKED_NEWS_SOURCES,
+)
+from src.utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class NewsdataClient:
@@ -12,7 +24,12 @@ class NewsdataClient:
 
     BASE_URL = "https://newsdata.io/api/1/news"
 
-    def __init__(self, api_key: str, timeout: int = 10, max_retries: int = 3):
+    def __init__(
+        self,
+        api_key: str,
+        timeout: int = DEFAULT_NEWS_API_TIMEOUT,
+        max_retries: int = DEFAULT_NEWS_API_MAX_RETRIES
+    ):
         """Initialize the Newsdata client.
 
         Args:
@@ -20,6 +37,9 @@ class NewsdataClient:
             timeout: Request timeout in seconds
             max_retries: Maximum number of retries for failed requests
         """
+        if not api_key:
+            raise ValueError("API key cannot be empty")
+
         self.api_key = api_key
         self.timeout = timeout
         self.max_retries = max_retries
@@ -51,34 +71,49 @@ class NewsdataClient:
         """
         from_date, to_date = self._get_date_window(days_lookback, timezone)
 
+        # Fix: Ensure at least 1 article per strategy
+        articles_per_strategy = max(1, max_articles // 3)
+        logger.info(f"[{company}] Fetching {articles_per_strategy} articles per strategy")
+
+        # Parallel execution of all three strategies
         all_articles = []
-        articles_per_strategy = max_articles // 3 + 1
 
-        # Strategy 1: Direct mentions in headlines
-        print(f"[{company}] Fetching direct mentions...")
-        direct_articles = self._fetch_direct_mentions(
-            company, from_date, to_date, articles_per_strategy
-        )
-        all_articles.extend(direct_articles)
-        print(f"[{company}] Found {len(direct_articles)} direct mentions")
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {}
 
-        # Strategy 2: Official press (company domain and newsroom)
-        if website or newsroom:
-            print(f"[{company}] Fetching official press...")
-            press_articles = self._fetch_official_press(
-                company, website, newsroom, from_date, to_date, articles_per_strategy
+            # Strategy 1: Direct mentions in headlines
+            future1 = executor.submit(
+                self._fetch_direct_mentions,
+                company, from_date, to_date, articles_per_strategy
             )
-            all_articles.extend(press_articles)
-            print(f"[{company}] Found {len(press_articles)} official press articles")
+            futures[future1] = "direct_mentions"
 
-        # Strategy 3: Press wires and partner activity
-        print(f"[{company}] Fetching press wires...")
-        wire_articles = self._fetch_press_wires(
-            company, keywords, from_date, to_date, articles_per_strategy
-        )
-        all_articles.extend(wire_articles)
-        print(f"[{company}] Found {len(wire_articles)} press wire articles")
+            # Strategy 2: Official press (company domain and newsroom)
+            if website or newsroom:
+                future2 = executor.submit(
+                    self._fetch_official_press,
+                    company, website, newsroom, from_date, to_date, articles_per_strategy
+                )
+                futures[future2] = "official_press"
 
+            # Strategy 3: Press wires and partner activity
+            future3 = executor.submit(
+                self._fetch_press_wires,
+                company, keywords, from_date, to_date, articles_per_strategy
+            )
+            futures[future3] = "press_wires"
+
+            # Collect results
+            for future in as_completed(futures):
+                strategy = futures[future]
+                try:
+                    articles = future.result()
+                    all_articles.extend(articles)
+                    logger.info(f"[{company}] {strategy}: {len(articles)} articles")
+                except Exception as e:
+                    logger.error(f"[{company}] Error in {strategy}: {e}")
+
+        logger.info(f"[{company}] Total fetched: {len(all_articles)} articles")
         return all_articles
 
     def _fetch_direct_mentions(
@@ -108,12 +143,23 @@ class NewsdataClient:
         max_results: int
     ) -> List[Dict]:
         """Fetch articles from company's official domains."""
-        domains = [website]
+        domains = [website] if website else []
+
         if newsroom:
-            # Extract domain from newsroom URL if it's different
-            newsroom_domain = newsroom.replace('https://', '').replace('http://', '').split('/')[0]
-            if newsroom_domain != website:
-                domains.append(newsroom_domain)
+            # Fix: Properly extract domain using urlparse
+            try:
+                parsed = urlparse(newsroom)
+                newsroom_domain = parsed.netloc or newsroom.split('/')[0]
+                # Remove www prefix
+                newsroom_domain = newsroom_domain.replace('www.', '')
+                if newsroom_domain and newsroom_domain != website:
+                    domains.append(newsroom_domain)
+            except Exception as e:
+                logger.warning(f"[{company}] Failed to parse newsroom URL {newsroom}: {e}")
+
+        if not domains:
+            logger.warning(f"[{company}] No domains for official press search")
+            return []
 
         params = {
             'domainurl': ','.join(domains),
@@ -136,31 +182,13 @@ class NewsdataClient:
         keyword_terms = ' OR '.join(keywords[:6])  # Limit to avoid overly long queries
         query = f'({keyword_terms}) AND "{company}"'
 
-        # Allowed press wire domains
-        allowed_domains = [
-            'businesswire.com',
-            'prnewswire.com',
-            'globenewswire.com',
-            'reuters.com',
-            'bloomberg.com'
-        ]
-
-        # Domains to exclude
-        excluded_domains = [
-            'seekingalpha.com',
-            'fool.com',
-            'benzinga.com',
-            'stocktwits.com',
-            'finance.yahoo.com'
-        ]
-
         params = {
             'q': query,
             'language': 'en',
             'from_date': from_date,
             'to_date': to_date,
-            'domainurl': ','.join(allowed_domains),
-            'excludedomain': ','.join(excluded_domains)
+            'domainurl': ','.join(PRESS_WIRE_DOMAINS),
+            'excludedomain': ','.join(BLOCKED_NEWS_SOURCES)
         }
         return self._paginated_fetch(params, max_results)
 
@@ -173,9 +201,8 @@ class NewsdataClient:
         articles = []
         next_page = None
         page_count = 0
-        max_pages = 5  # Safety limit
 
-        while len(articles) < max_results and page_count < max_pages:
+        while len(articles) < max_results and page_count < DEFAULT_NEWS_MAX_PAGES:
             try:
                 # Add pagination token if available
                 if next_page:
@@ -183,8 +210,21 @@ class NewsdataClient:
 
                 response = self._make_request(params)
 
-                if response and response.get('status') == 'success':
+                if not response:
+                    logger.warning("Empty response from API")
+                    break
+
+                # Fix: Validate response structure
+                if not isinstance(response, dict):
+                    logger.error(f"Invalid response type: {type(response)}")
+                    break
+
+                if response.get('status') == 'success':
                     results = response.get('results', [])
+                    if not isinstance(results, list):
+                        logger.error("Results is not a list")
+                        break
+
                     articles.extend(results)
 
                     # Check for next page
@@ -193,39 +233,46 @@ class NewsdataClient:
                         break
 
                     page_count += 1
-                    time.sleep(0.2)  # Small delay between pages
+                    # Only sleep when actually paginating
+                elif response.get('status') == 'error':
+                    error_msg = response.get('results', {}).get('message', 'Unknown error')
+                    logger.error(f"API error: {error_msg}")
+                    break
                 else:
+                    logger.warning(f"Unexpected response status: {response.get('status')}")
                     break
 
             except Exception as e:
-                print(f"Error during pagination: {e}")
+                logger.error(f"Error during pagination: {e}")
                 break
 
         return articles[:max_results]
 
     def _make_request(self, params: Dict) -> Optional[Dict]:
         """Make an API request with retry logic."""
-        params['apikey'] = self.api_key
+        # Add API key to params
+        request_params = params.copy()
+        request_params['apikey'] = self.api_key
 
         for attempt in range(self.max_retries):
             try:
                 response = self.session.get(
                     self.BASE_URL,
-                    params=params,
+                    params=request_params,
                     timeout=self.timeout
                 )
 
                 # Handle rate limiting
                 if response.status_code == 429:
                     wait_time = 2 ** attempt
-                    print(f"Rate limited. Waiting {wait_time}s...")
+                    logger.warning(f"Rate limited. Waiting {wait_time}s...")
                     time.sleep(wait_time)
                     continue
 
                 # Handle server errors
                 if response.status_code >= 500:
                     wait_time = 2 ** attempt
-                    print(f"Server error {response.status_code}. Waiting {wait_time}s...")
+                    logger.warning(f"Server error {response.status_code}. Waiting {wait_time}s...")
                     time.sleep(wait_time)
                     continue
 
@@ -233,14 +280,19 @@ class NewsdataClient:
                 return response.json()
 
             except requests.exceptions.Timeout:
-                print(f"Request timeout (attempt {attempt + 1}/{self.max_retries})")
+                logger.warning(f"Request timeout (attempt {attempt + 1}/{self.max_retries})")
                 if attempt < self.max_retries - 1:
                     time.sleep(2 ** attempt)
             except requests.exceptions.RequestException as e:
-                print(f"Request error: {e}")
+                logger.error(f"Request error: {e}")
                 if attempt < self.max_retries - 1:
                     time.sleep(2 ** attempt)
+            except ValueError as e:
+                # JSON decode error
+                logger.error(f"Failed to parse response JSON: {e}")
+                break
 
+        logger.error("All retry attempts exhausted")
         return None
 
     def _get_date_window(
@@ -257,7 +309,12 @@ class NewsdataClient:
         Returns:
             Tuple of (from_date, to_date) in ISO format
         """
-        tz = pytz.timezone(timezone)
+        try:
+            tz = pytz.timezone(timezone)
+        except pytz.exceptions.UnknownTimeZoneError:
+            logger.warning(f"Unknown timezone: {timezone}. Using UTC")
+            tz = pytz.UTC
+
         now = datetime.now(tz)
         from_datetime = now - timedelta(days=days_lookback)
 

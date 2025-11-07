@@ -14,8 +14,6 @@ python-dateutil==2.9.0
 pytz==2024.1
 pyyaml==6.0.2
 
-# Text processing
-difflib
-
-# Optional for better HTML extraction
-trafilatura==1.12.2
+# Optional dependencies
+# RSS feed parsing
+feedparser==6.0.11

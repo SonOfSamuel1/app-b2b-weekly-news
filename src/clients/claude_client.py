@@ -1,26 +1,43 @@
 """Claude AI client for article summarization."""
 import anthropic
+from datetime import datetime
 from typing import Dict, List
+
+from src.constants import (
+    CLAUDE_MAX_TOKENS,
+    CLAUDE_TEMPERATURE,
+    CLAUDE_REQUEST_TIMEOUT,
+    MAX_DESCRIPTION_LENGTH,
+)
+from src.utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class ClaudeClient:
     """Client for summarizing articles using Claude AI."""
 
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-5-20250929"):
+    def __init__(self, api_key: str, model: str):
         """Initialize the Claude client.
 
         Args:
             api_key: Anthropic API key
             model: Claude model to use
         """
-        self.client = anthropic.Anthropic(api_key=api_key)
+        if not api_key:
+            raise ValueError("API key cannot be empty")
+
+        self.client = anthropic.Anthropic(
+            api_key=api_key,
+            timeout=CLAUDE_REQUEST_TIMEOUT
+        )
         self.model = model
 
     def summarize_articles(
         self,
         company: str,
         articles: List[Dict]
-    ) -> Dict[str, any]:
+    ) -> Dict:
         """Summarize a list of articles for a company.
 
         Args:
@@ -31,11 +48,13 @@ class ClaudeClient:
             Dictionary with summary sections and metadata
         """
         if not articles:
+            logger.info(f"[{company}] No articles to summarize")
             return {
                 'company': company,
                 'summary': self._generate_empty_summary(),
                 'article_count': 0,
-                'links': []
+                'links': [],
+                'tokens_used': 0
             }
 
         # Build the prompt
@@ -45,8 +64,8 @@ class ClaudeClient:
             # Call Claude API
             message = self.client.messages.create(
                 model=self.model,
-                max_tokens=900,
-                temperature=0.3,
+                max_tokens=CLAUDE_MAX_TOKENS,
+                temperature=CLAUDE_TEMPERATURE,
                 messages=[
                     {
                         "role": "user",
@@ -55,29 +74,38 @@ class ClaudeClient:
                 ]
             )
 
+            # Fix: Validate response structure
+            if not message or not hasattr(message, 'content'):
+                logger.error(f"[{company}] Invalid response from Claude API")
+                return self._error_response(company, articles, "Invalid API response")
+
+            if not message.content or len(message.content) == 0:
+                logger.error(f"[{company}] Empty content in Claude response")
+                return self._error_response(company, articles, "Empty response content")
+
             # Extract the summary text
             summary_text = message.content[0].text
 
             # Format links
             links = self._format_links(articles)
 
+            tokens_used = message.usage.input_tokens + message.usage.output_tokens
+            logger.info(f"[{company}] Summarization complete. Tokens used: {tokens_used}")
+
             return {
                 'company': company,
                 'summary': summary_text,
                 'article_count': len(articles),
                 'links': links,
-                'tokens_used': message.usage.input_tokens + message.usage.output_tokens
+                'tokens_used': tokens_used
             }
 
+        except anthropic.APIError as e:
+            logger.error(f"[{company}] Claude API error: {e}")
+            return self._error_response(company, articles, f"API error: {str(e)}")
         except Exception as e:
-            print(f"Error summarizing articles for {company}: {e}")
-            return {
-                'company': company,
-                'summary': f"Error generating summary: {str(e)}",
-                'article_count': len(articles),
-                'links': self._format_links(articles),
-                'error': str(e)
-            }
+            logger.error(f"[{company}] Unexpected error during summarization: {e}")
+            return self._error_response(company, articles, f"Unexpected error: {str(e)}")
 
     def _build_prompt(self, company: str, articles: List[Dict]) -> str:
         """Build the prompt for Claude.
@@ -98,15 +126,7 @@ class ClaudeClient:
             url = article.get('link', '')
 
             # Format publication date
-            if pub_date:
-                try:
-                    from datetime import datetime
-                    dt = datetime.fromisoformat(pub_date.replace('Z', '+00:00'))
-                    pub_date_fmt = dt.strftime('%b %d, %Y')
-                except:
-                    pub_date_fmt = pub_date
-            else:
-                pub_date_fmt = 'Date unknown'
+            pub_date_fmt = self._format_date(pub_date)
 
             article_list.append(
                 f"{idx}. **{title}**\n"
@@ -118,8 +138,8 @@ class ClaudeClient:
             description = article.get('description', '')
             if description:
                 # Truncate long descriptions
-                if len(description) > 200:
-                    description = description[:197] + '...'
+                if len(description) > MAX_DESCRIPTION_LENGTH:
+                    description = description[:MAX_DESCRIPTION_LENGTH - 3] + '...'
                 article_list.append(f"   Summary: {description}")
 
             article_list.append("")  # Blank line
@@ -156,6 +176,25 @@ class ClaudeClient:
 
         return prompt
 
+    def _format_date(self, pub_date: str) -> str:
+        """Format a publication date string.
+
+        Args:
+            pub_date: ISO date string
+
+        Returns:
+            Formatted date string
+        """
+        if not pub_date:
+            return 'Date unknown'
+
+        try:
+            dt = datetime.fromisoformat(pub_date.replace('Z', '+00:00'))
+            return dt.strftime('%b %d, %Y')
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Failed to parse date '{pub_date}': {e}")
+            return pub_date[:10] if len(pub_date) >= 10 else pub_date
+
     def _format_links(self, articles: List[Dict]) -> List[Dict]:
         """Format articles as link references.
 
@@ -187,3 +226,28 @@ class ClaudeClient:
             Empty summary message
         """
         return "**No material items this week.**\n\nNo significant news coverage found for this account in the past 7 days."
+
+    def _error_response(
+        self,
+        company: str,
+        articles: List[Dict],
+        error: str
+    ) -> Dict:
+        """Generate an error response.
+
+        Args:
+            company: Company name
+            articles: List of articles
+            error: Error message
+
+        Returns:
+            Error response dictionary
+        """
+        return {
+            'company': company,
+            'summary': f"**Error generating summary**\n\n{error}",
+            'article_count': len(articles),
+            'links': self._format_links(articles),
+            'tokens_used': 0,
+            'error': error
+        }
